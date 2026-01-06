@@ -326,6 +326,8 @@ func parseQuery(sql string) queryToken {
 		if strings.ToUpper(part) == "SELECT" {
 			j := i + 1
 			for j < len(commandParts) && strings.ToUpper(commandParts[j]) != "FROM" {
+				commandParts[j] = strings.Trim(commandParts[j], ",")
+				commandParts[j] = strings.TrimSpace(commandParts[j])
 				queryToken.selectClauseParts = append(queryToken.selectClauseParts, commandParts[j])
 				j++
 			}
