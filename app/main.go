@@ -7,8 +7,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
 )
 
 type DataBaseHeaderConfig struct {
@@ -36,16 +34,36 @@ type DataBaseHeaderConfig struct {
 	VersionValidForNumber      uint32
 	SQLiteVersionNumber        uint32
 }
-
 type cellOffSets struct {
 	cellStartOffSet uint16
 	cellEndOffSet   uint16
 }
+type queryToken struct {
+	selectClauseParts []string
+	tableName         string
+	filterColumnName  string
+	filterValue       string
+}
+type objectMetadata struct {
+	coreObject SQLITE_MASTER_STRUCT
+	columns    []string
+	indexes    [][]string
+}
+type SQLITE_MASTER_STRUCT struct {
+	objectType    string
+	objectName    string
+	objectTblName string
+	rootPage      uint32
+	createSQL     string
+}
 
 const TABLE_SQLITE_SCHEMA = "sqlite_schema"
 
+var SQLITE_MASTER_COLUMNS = []string{"type", "name", "tbl_name", "rootpage", "sql"}
 var databaseFilePath string
 var DatabaseHeader DataBaseHeaderConfig
+var parsedObjectsMetadataMap = make(map[string]objectMetadata)
+var KEYWORDS_TO_IGNORE = []string{"PRIMARY", "FOREIGN", "CONSTRAINT", "CHECK", "UNIQUE", "REFERENCES", "GENERATED"}
 
 func readDatabaseHeader(file *os.File) ([]byte, error) {
 
@@ -125,16 +143,87 @@ func decodeVarint(arr []byte) (int64, int) {
 	return value, i + 1
 }
 
-func getTableColumnArray(tableName string) []string {
-	var columnsNameArray []string
-	if tableName == TABLE_SQLITE_SCHEMA {
-		return []string{"type", "name", "tbl_name", "rootpage", "sql"}
-	} else {
-		//get the row details from the sqlite schema
-		//parse the create table sql command
-		//and return the column names from them
-		return columnsNameArray
+func parseColumnNamesFromCreateSQL(schemaCreationSql string) []string {
+	startIndex := strings.Index(schemaCreationSql, "(")
+	endIndex := strings.LastIndex(schemaCreationSql, ")")
+	if startIndex == -1 || endIndex == -1 || endIndex <= startIndex {
+		return []string{}
 	}
+	columnsDefStr := schemaCreationSql[startIndex+1 : endIndex]
+	columnsDefParts := strings.Split(columnsDefStr, ",")
+	var columnNames []string
+	for _, colDef := range columnsDefParts {
+		colDef = strings.TrimSpace(colDef)
+		if colDef == "" {
+			continue
+		}
+		colDefParts := strings.Split(colDef, " ")
+		if len(colDefParts) > 0 {
+			columnName := strings.TrimSpace(colDefParts[0])
+			ignore := false
+			for _, keyword := range KEYWORDS_TO_IGNORE {
+				if strings.ToUpper(columnName) == keyword {
+					ignore = true
+					break
+				}
+			}
+			if !ignore {
+				columnNames = append(columnNames, columnName)
+			}
+		}
+	}
+	return columnNames
+}
+
+func getIndexColumnsFromIndexCreateSQL(indexesCreateSQL []string) [][]string {
+	var indexColumns [][]string
+	for _, createSQL := range indexesCreateSQL {
+		startIndex := strings.Index(createSQL, "(")
+		endIndex := strings.LastIndex(createSQL, ")")
+		if startIndex == -1 || endIndex == -1 || endIndex <= startIndex {
+			continue
+		}
+		columnsStr := createSQL[startIndex+1 : endIndex]
+		columnsParts := strings.Split(columnsStr, ",")
+		indexColumns = append(indexColumns, columnsParts)
+	}
+	return indexColumns
+}
+func getIndexesForTable(tableName string, objectsMetadataMap map[string]objectMetadata) [][]string {
+	var indexes [][]string
+	var indexesCreateSQL []string
+	for _, objectMeta := range objectsMetadataMap {
+		if objectMeta.coreObject.objectType == "index" && objectMeta.coreObject.objectTblName == tableName {
+			if objectMeta.coreObject.createSQL != "" {
+				indexesCreateSQL = append(indexesCreateSQL, objectMeta.coreObject.createSQL)
+			}
+		}
+	}
+	indexes = getIndexColumnsFromIndexCreateSQL(indexesCreateSQL)
+	return indexes
+}
+func getObjectMetaData(objectName map[string]interface{}) objectMetadata {
+	// for now we are considering object type table only
+	var objectMetadata objectMetadata
+	if objectTypeValue, exist := objectName["type"]; exist && objectTypeValue != nil {
+		objectMetadata.coreObject.objectType = string(objectTypeValue.([]byte))
+	}
+	if nameValue, exist := objectName["name"]; exist && nameValue != nil {
+		objectMetadata.coreObject.objectName = string(nameValue.([]byte))
+	}
+	if tblNameValue, exist := objectName["tbl_name"]; exist && tblNameValue != nil {
+		objectMetadata.coreObject.objectTblName = string(tblNameValue.([]byte))
+	}
+	if rootPageValue, exist := objectName["rootpage"]; exist && rootPageValue != nil {
+		objectMetadata.coreObject.rootPage = binary.BigEndian.Uint32(rootPageValue.([]byte))
+	}
+	if createSQLValue, exist := objectName["sql"]; exist && createSQLValue != nil {
+		objectMetadata.coreObject.createSQL = string(createSQLValue.([]byte))
+	}
+
+	objectMetadata.columns = parseColumnNamesFromCreateSQL(objectMetadata.coreObject.createSQL)
+	objectMetadata.indexes = getIndexesForTable(objectMetadata.coreObject.objectName, parsedObjectsMetadataMap)
+	return objectMetadata
 }
 
 func getColumnValue(rowContent []byte, serialType uint64) (interface{}, uint64) {
@@ -204,10 +293,120 @@ func parseCellData(cellContent []byte, tableColumnArray []string) map[string]int
 	return rowData
 }
 
+// write your own parsing logic here
+//assumptions
+// the command is a always a select query
+// there can be single, multiple column names or count(*) in the select clause
+//only one where condition which is an equality condition // add support for other operators later
+// no joins
+// no nested queries
+// no aggergation functions except count(*)
+// no group by or order by clauses
+// no limit or offset clauses
+// the data is always contained in the single page
+//sample command : SELECT name, color FROM apples WHERE color = 'Yellow'
+
+// trim the command and split by spaces
+func parseQuery(sql string) queryToken {
+	//write a better parser later
+	sql = strings.TrimSpace(sql)
+	var queryToken queryToken
+	commandParts := strings.Split(sql, " ")
+	for i := 0; i < len(commandParts); i++ {
+		part := commandParts[i]
+		if strings.ToUpper(part) == "SELECT" {
+			j := i + 1
+			for j < len(commandParts) && strings.ToUpper(commandParts[j]) != "FROM" {
+				queryToken.selectClauseParts = append(queryToken.selectClauseParts, commandParts[j])
+				j++
+			}
+			i = j - 1
+		} else if strings.ToUpper(part) == "FROM" {
+			if i+1 < len(commandParts) {
+				queryToken.tableName = commandParts[i+1]
+				i = i + 1
+			}
+		} else if strings.ToUpper(part) == "WHERE" {
+			if i+3 < len(commandParts) {
+				queryToken.filterColumnName = strings.TrimSpace(commandParts[i+1])
+				operand := strings.TrimSpace(commandParts[i+2])
+				if operand != "=" {
+					fmt.Println("Only equality operand is supported in where clause")
+					os.Exit(1)
+				}
+				filterValue := strings.Trim(commandParts[i+3], "'")
+				if filterValue == "" {
+					fmt.Println("Invalid where condition value")
+					os.Exit(1)
+				}
+			}
+		}
+	}
+	return queryToken
+}
+
+func getCellOffSetsFromPage(pageContent []byte) []cellOffSets {
+	if pageContent[0] != 0x0D {
+		log.Fatal("only leaf pages are supported currently")
+	}
+	pageHeader := pageContent[0:8]
+	numberOfCells := binary.BigEndian.Uint16(pageHeader[3:5])
+	cellOffSetsArray := pageContent[8 : 8+2*numberOfCells]
+	var cellOffSetsArrayParsed []cellOffSets
+	for i := 0; i < int(numberOfCells); i++ {
+		var cellOffset cellOffSets
+		cellOffset.cellStartOffSet = binary.BigEndian.Uint16(cellOffSetsArray[i*2 : (i*2)+2])
+		if i == 0 {
+			cellOffset.cellEndOffSet = DatabaseHeader.PageSize - uint16(DatabaseHeader.ReservedSpacePerPage)
+		} else {
+			cellOffset.cellEndOffSet = binary.BigEndian.Uint16(cellOffSetsArray[(i-1)*2 : ((i-1)*2)+2])
+		}
+		cellOffSetsArrayParsed = append(cellOffSetsArrayParsed, cellOffset)
+	}
+	return cellOffSetsArrayParsed
+}
+func loadSQLiteSchema(file *os.File) []map[string]interface{} {
+	firstPageContent, err := getPageContent(1, file)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cellOffSetsArray := getCellOffSetsFromPage(firstPageContent[100:])
+	var resultedRowsArray []map[string]interface{}
+	for i := 0; i < len(cellOffSetsArray); i++ {
+		cellContent := firstPageContent[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
+		rowDataMap := parseCellData(cellContent, SQLITE_MASTER_COLUMNS)
+		resultedRowsArray = append(resultedRowsArray, rowDataMap)
+	}
+	return resultedRowsArray
+}
+
+func loadAllObjectMetadata(file *os.File) map[string]objectMetadata {
+	sqliteSchemaContent := loadSQLiteSchema(file)
+	objectsMetadataMap := make(map[string]objectMetadata)
+	for _, row := range sqliteSchemaContent {
+		nameColumnValue, exist := row["name"]
+		if exist && nameColumnValue != nil {
+			objectName := string(nameColumnValue.([]byte))
+			objectMetaData := getObjectMetaData(row)
+			objectsMetadataMap[objectName] = objectMetaData
+		}
+	}
+	return objectsMetadataMap
+}
+
+func getParsedTableData(tableRawData []byte, tableColumnArray []string) []map[string]interface{} {
+	cellOffSetsArray := getCellOffSetsFromPage(tableRawData)
+	var parsedTableData []map[string]interface{}
+	for i := 0; i < len(cellOffSetsArray); i++ {
+		cellContent := tableRawData[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
+		rowDataMap := parseCellData(cellContent, tableColumnArray)
+		parsedTableData = append(parsedTableData, rowDataMap)
+	}
+	return parsedTableData
+}
 func main() {
 	databaseFilePath = os.Args[1]
 	command := os.Args[2]
-
 	file, err := os.Open(databaseFilePath)
 	if err != nil {
 		log.Fatal(err)
@@ -237,62 +436,75 @@ func main() {
 		fmt.Printf("\nnumber of tables: %v\n", tableCount)
 	case ".tables":
 		//considering the data only in the first page for now
-		firstPageContent, err := getPageContent(1, file)
+		sqliteSchemaContent := loadSQLiteSchema(file)
+		var tableNames []string
+		for _, row := range sqliteSchemaContent {
+			nameColumnValue, exist := row["name"]
+			if exist && nameColumnValue != nil {
+				tableNames = append(tableNames, string(nameColumnValue.([]byte)))
+			}
+		}
+		sort.Strings(tableNames)
+		fmt.Print(strings.Join(tableNames, " "))
+	default:
+
+		queryToken := parseQuery(command)
+		parsedObjectsMetadataMap = loadAllObjectMetadata(file)
+		tableMetadata, exist := parsedObjectsMetadataMap[queryToken.tableName]
+		if !exist {
+			fmt.Println("Table not found:", queryToken.tableName)
+			os.Exit(1)
+		}
+
+		tableRawData, err := getPageContent(tableMetadata.coreObject.rootPage, file)
 		if err != nil {
 			log.Fatal(err)
 		}
-		//means this page is a leaf page
-		//a 8 byte header + n cell pointers + cell content area
-		firstPageHeader := firstPageContent[100:108]
-		numberOfCells := binary.BigEndian.Uint16(firstPageHeader[3:5])
-		cellOffSetsArray := firstPageContent[108 : 108+2*numberOfCells]
-		sortedCellPointers := make([]uint16, numberOfCells)
-		for i := 0; i < int(numberOfCells); i++ {
-			sortedCellPointers[i] = binary.BigEndian.Uint16(cellOffSetsArray[i*2 : (i*2)+2])
-		}
-		sort.Slice(sortedCellPointers, func(i, j int) bool {
-			return sortedCellPointers[i] < sortedCellPointers[j]
-		})
-		var cellOffSetsArraySorted []cellOffSets
-		for i := 0; i < int(numberOfCells); i++ {
-			var cellOffset cellOffSets
-			cellOffset.cellStartOffSet = sortedCellPointers[i]
-			if i == int(numberOfCells)-1 {
-				cellOffset.cellEndOffSet = DatabaseHeader.PageSize - uint16(DatabaseHeader.ReservedSpacePerPage)
-			} else {
-				cellOffset.cellEndOffSet = sortedCellPointers[i+1]
-			}
-			cellOffSetsArraySorted = append(cellOffSetsArraySorted, cellOffset)
-		}
-		var resultedRowsArray []string
-		for i := 0; i < int(numberOfCells); i++ {
-			cellContent := firstPageContent[cellOffSetsArraySorted[i].cellStartOffSet:cellOffSetsArraySorted[i].cellEndOffSet]
-			//considering that the this is a table leaf cell and payload do not oveflow pages
-			// table leaf cell format:
-			// payload size (varint) + rowid (varint) + payload
-			// payload format:
-			// header size (varint) + serial type array + column values
-			// the sqlite master table has the following columns:
-			//get the payload size
 
-			columnToBeFetched := []string{"name"}
-			tableName := TABLE_SQLITE_SCHEMA
+		parsedTableData := getParsedTableData(tableRawData, tableMetadata.columns)
 
-			tableColumnArray := getTableColumnArray(tableName)
-			var filterColumns []string
-			getRowDataMap := parseCellData(cellContent, tableColumnArray)
-			// for key, value := range getRowDataMap {
-			// 	printInterface(key, value)
-			// }
-			for _, columnName := range columnToBeFetched {
-				filterColumns = append(filterColumns, string(getRowDataMap[columnName].([]byte)))
+		//filter the data based on where condition if present
+		var filteredData []map[string]interface{}
+		if queryToken.filterColumnName != "" {
+			for _, row := range parsedTableData {
+				if val, exist := row[queryToken.filterColumnName]; exist {
+					strVal, ok := val.([]byte)
+					if ok && string(strVal) == queryToken.filterValue {
+						filteredData = append(filteredData, row)
+					}
+				}
 			}
-			resultedRowsArray = append(resultedRowsArray, strings.Join(filterColumns, " "))
+		} else {
+			filteredData = parsedTableData
 		}
-		sort.Strings(resultedRowsArray)
-		fmt.Print(strings.Join(resultedRowsArray, " "))
-	default:
-		fmt.Println("Unknown command", command)
-		os.Exit(1)
+
+		//prepare the result based on select clause parts
+		if len(queryToken.selectClauseParts) == 1 && strings.ToUpper(queryToken.selectClauseParts[0]) == "COUNT(*)" {
+			fmt.Println(len(filteredData))
+			return
+		} else {
+			var resultRows []string
+			for _, row := range filteredData {
+				var selectedValues []string
+				for _, colPart := range queryToken.selectClauseParts {
+					colPart = strings.TrimSpace(colPart)
+					if val, exist := row[colPart]; exist {
+						strVal, ok := val.([]byte)
+						if ok {
+							selectedValues = append(selectedValues, string(strVal))
+						} else {
+							selectedValues = append(selectedValues, fmt.Sprintf("%v", val))
+						}
+					} else {
+						selectedValues = append(selectedValues, "NULL")
+					}
+				}
+				resultRows = append(resultRows, strings.Join(selectedValues, "|"))
+			}
+			for _, resultRow := range resultRows {
+				fmt.Println(resultRow)
+			}
+			return
+		}
 	}
 }
