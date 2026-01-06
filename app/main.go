@@ -350,6 +350,8 @@ func parseQuery(sql string) queryToken {
 					fmt.Println("Invalid where condition value")
 					os.Exit(1)
 				}
+				queryToken.filterValue = filterValue
+				i = i + 3
 			}
 		}
 	}
