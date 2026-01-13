@@ -404,28 +404,7 @@ func parseQuery(sql string) queryToken {
 	return queryToken
 }
 
-// func getCellOffSetsFromPage(pageContent []byte) []cellOffSets {
-// 	if pageContent[0] != 0x0D {
-// 		log.Fatal("only leaf pages are supported currently")
-// 	}
-// 	pageHeader := pageContent[0:8]
-// 	numberOfCells := binary.BigEndian.Uint16(pageHeader[3:5])
-// 	cellOffSetsArray := pageContent[8 : 8+2*numberOfCells]
-// 	var cellOffSetsArrayParsed []cellOffSets
-// 	for i := 0; i < int(numberOfCells); i++ {
-// 		var cellOffset cellOffSets
-// 		cellOffset.cellStartOffSet = binary.BigEndian.Uint16(cellOffSetsArray[i*2 : (i*2)+2])
-// 		if i == 0 {
-// 			cellOffset.cellEndOffSet = DatabaseHeader.PageSize - uint16(DatabaseHeader.ReservedSpacePerPage)
-// 		} else {
-// 			cellOffset.cellEndOffSet = binary.BigEndian.Uint16(cellOffSetsArray[(i-1)*2 : ((i-1)*2)+2])
-// 		}
-// 		cellOffSetsArrayParsed = append(cellOffSetsArrayParsed, cellOffset)
-// 	}
-// 	return cellOffSetsArrayParsed
-// }
-
-func getCellOffSetsFromPage(pageContent []byte, pageHeader pageHeaderStruct) []cellOffSets {
+func getCellOffSetsFromPage(pageContent []byte, pageHeader pageHeaderStruct) []uint16 {
 
 	pageType := pageHeader.pageType
 	var pageContentStartIndex uint16
@@ -434,25 +413,19 @@ func getCellOffSetsFromPage(pageContent []byte, pageHeader pageHeaderStruct) []c
 	} else {
 		pageContentStartIndex = 12
 	}
-	// fmt.Println("number of cells in root page ", pageHeader.numberOfCells)
 	cellOffSetsArray := pageContent[pageContentStartIndex : pageContentStartIndex+2*pageHeader.numberOfCells]
-	var cellOffSetsArrayParsed []cellOffSets
+	var cellOffSets []uint16
 
 	for i := 0; i < int(pageHeader.numberOfCells); i++ {
-		var cellOffset cellOffSets
-		cellOffset.cellStartOffSet = binary.BigEndian.Uint16(cellOffSetsArray[i*2 : (i*2)+2])
-		if i == 0 {
-			cellOffset.cellEndOffSet = DatabaseHeader.PageSize - uint16(DatabaseHeader.ReservedSpacePerPage)
-		} else {
-			cellOffset.cellEndOffSet = binary.BigEndian.Uint16(cellOffSetsArray[(i-1)*2 : ((i-1)*2)+2])
-		}
-		cellOffSetsArrayParsed = append(cellOffSetsArrayParsed, cellOffset)
+		cellOffSets = append(cellOffSets, binary.BigEndian.Uint16(cellOffSetsArray[i*2:(i*2)+2]))
 	}
-	return cellOffSetsArrayParsed
+	return cellOffSets
 }
-func parseCellData(cellContent []byte, tableColumnArray []string) map[string]interface{} {
+func parseTableLeafCellData(cellContent []byte, tableColumnArray []string) map[string]interface{} {
+
 	payloadSize, n := decodeVarint(cellContent)
-	_, m := decodeVarint(cellContent[n:])
+	rowId, m := decodeVarint(cellContent[n:])
+	_ = rowId
 	payload := cellContent[n+m : n+m+int(payloadSize)]
 	headerSize, k := decodeVarint(payload)
 	header := payload[k:headerSize]
@@ -466,7 +439,7 @@ func parseCellData(cellContent []byte, tableColumnArray []string) map[string]int
 	payloadBody := payload[headerSize:]
 	payloadIndex := 0
 	rowData := make(map[string]interface{})
-
+	// fmt.Println()
 	for i, serialType := range serialTypes {
 		unparsedBytes := payloadBody[payloadIndex:]
 		val, k := getColumnValue(unparsedBytes, serialType)
@@ -481,12 +454,14 @@ func loadSQLiteSchema(file *os.File) []map[string]interface{} {
 	if err != nil {
 		log.Fatal(err)
 	}
-	pageHeader := getPageHeader(firstPageContent[100:])
-	cellOffSetsArray := getCellOffSetsFromPage(firstPageContent[100:], pageHeader)
+	pageContent := firstPageContent[100:]
+	pageHeader := getPageHeader(pageContent)
+	cellOffSetsArray := getCellOffSetsFromPage(pageContent, pageHeader)
+	fmt.Println(cellOffSetsArray)
+	// os.Exit(1)
 	var resultedRowsArray []map[string]interface{}
-	for i := 0; i < len(cellOffSetsArray); i++ {
-		cellContent := firstPageContent[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
-		rowDataMap := parseCellData(cellContent, SQLITE_MASTER_COLUMNS)
+	for i := 0; i < int(pageHeader.numberOfCells); i++ {
+		rowDataMap := parseTableLeafCellData(pageContent[cellOffSetsArray[i]:], SQLITE_MASTER_COLUMNS)
 		resultedRowsArray = append(resultedRowsArray, rowDataMap)
 	}
 	return resultedRowsArray
@@ -582,12 +557,12 @@ func getIndexLeafPageId(queryToken queryToken, pageId uint32, file *os.File) (ui
 		cellOffSetsArray := getCellOffSetsFromPage(indexPageContent, pageHeader)
 		var indexInteriorCells []IndexInteriorCell
 		keyFound := false
-		for i := 0; i < len(cellOffSetsArray); i++ {
+		for i := uint16(0); i < pageHeader.numberOfCells; i++ {
 			if keyFound {
 				break
 			}
-			cellContent := indexPageContent[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
-			indexInteriorCell := parseIndexInteriorCellData(cellContent)
+
+			indexInteriorCell := parseIndexInteriorCellData(indexPageContent[cellOffSetsArray[i]:])
 			if indexInteriorCell.overflowPage != 0 {
 				remainPayloadSize := indexInteriorCell.keyPayloadSize - uint32(len(indexInteriorCell.key))
 				remainingPayload, err := getOverflowPagePayload(indexInteriorCell.overflowPage, remainPayloadSize, file)
@@ -654,8 +629,7 @@ func getRowIdsFromIndexLeafPage(queryToken queryToken, filterColumns []string, l
 	cellOffSetsArray := getCellOffSetsFromPage(leafPageContent, pageHeader)
 	var rowIds []int64
 	for i := 0; i < len(cellOffSetsArray); i++ {
-		cellContent := leafPageContent[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
-		parsedCellContent := parseIndexLeafCellData(cellContent, filterColumns)
+		parsedCellContent := parseIndexLeafCellData(leafPageContent[cellOffSetsArray[i]:], filterColumns)
 		if parsedCellContent.key != nil && strings.Compare(string(parsedCellContent.key), queryToken.filterValue) == 0 {
 			rowIds = append(rowIds, parsedCellContent.rowId)
 		}
@@ -681,7 +655,7 @@ func getLeafPageOfTableIndex(rowId int64, pageId uint32, file *os.File, pagesInM
 		//var rightPagePointer uint32
 		parsedCells := make([]TableInTeriorCell, 0)
 		for i := 0; i < len(cellOffSetsArray); i++ {
-			cellContent := pageContent[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
+			cellContent := pageContent[cellOffSetsArray[i]:]
 			leftChildPointer := binary.BigEndian.Uint32(cellContent[0:4])
 			rowId, _ := decodeVarint(cellContent[4:])
 			parsedCells = append(parsedCells, TableInTeriorCell{
@@ -770,7 +744,7 @@ func getTableDataFromTableIndex(rowIds []int64, tableMetadata objectMetadata, fi
 		pageHeader := getPageHeader(leafPageContent)
 		cellOffSetsArray := getCellOffSetsFromPage(leafPageContent, pageHeader)
 		for i := 0; i < len(cellOffSetsArray); i++ {
-			cellContent := leafPageContent[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
+			cellContent := leafPageContent[cellOffSetsArray[i]:]
 			payloadSize, n := decodeVarint(cellContent)
 			rowIdInCell, m := decodeVarint(cellContent[n:])
 			if rowIdInCell == rowId {
@@ -796,17 +770,16 @@ func getFullTableData(rootPage uint32, columns []string, file *os.File, pagesInM
 	}
 	pageHeader := getPageHeader(pageContent)
 	if pageHeader.pageType == B_TREE_PAGE_TYPES.Table_Leaf_Page {
-		// fmt.Println(100)
 		cellOffSetsArray := getCellOffSetsFromPage(pageContent, pageHeader)
 		for i := 0; i < len(cellOffSetsArray); i++ {
-			cellContent := pageContent[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
+			cellContent := pageContent[cellOffSetsArray[i]:]
 			parsedCellContent := parseTableLeafCellPayload(cellContent, columns)
 			*parsedTableData = append(*parsedTableData, parsedCellContent)
 		}
 	} else if pageHeader.pageType == B_TREE_PAGE_TYPES.Table_Interior_Page {
 		cellOffSetsArray := getCellOffSetsFromPage(pageContent, pageHeader)
 		for i := 0; i < len(cellOffSetsArray); i++ {
-			cellContent := pageContent[cellOffSetsArray[i].cellStartOffSet:cellOffSetsArray[i].cellEndOffSet]
+			cellContent := pageContent[cellOffSetsArray[i]:]
 			leftChildPointer := binary.BigEndian.Uint32(cellContent[0:4])
 			err := getFullTableData(leftChildPointer, columns, file, pagesInMemory, parsedTableData)
 			if err != nil {
