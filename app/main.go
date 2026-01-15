@@ -9,90 +9,6 @@ import (
 	"strings"
 )
 
-type DataBaseHeaderConfig struct {
-	HeaderString               [16]byte
-	PageSize                   uint16
-	FileFormatWriteVersion     byte
-	FileFormatReadVersion      byte
-	ReservedSpacePerPage       byte
-	MaxEmbeddedPayloadFraction byte
-	MinEmbeddedPayloadFraction byte
-	LeafPayloadFraction        byte
-	FileChangeCounter          uint32
-	DatabaseSizeInPages        uint32
-	FirstFreelistTrunkPage     uint32
-	TotalFreelistPages         uint32
-	SchemaCookie               uint32
-	SchemaFormatNumber         uint32
-	DefaultPageCacheSize       uint32
-	LargestRootBtreePage       uint32
-	TextEncoding               uint32
-	UserVersion                uint32
-	IncrementalVacuumMode      uint32
-	ApplicationID              uint32
-	ReservedForExpansion       [20]byte
-	VersionValidForNumber      uint32
-	SQLiteVersionNumber        uint32
-}
-type queryToken struct {
-	selectClauseParts []string
-	tableName         string
-	filterColumnName  string
-	filterValue       string
-}
-
-type indexMetadata struct {
-	indexName string
-	columns   []string
-}
-type objectMetadata struct {
-	coreObject          SQLITE_MASTER_STRUCT
-	isIntegerPrimaryKey bool
-	columns             []string
-	indexes             []indexMetadata
-}
-type SQLITE_MASTER_STRUCT struct {
-	objectType    string
-	objectName    string
-	objectTblName string
-	rootPage      uint32
-	createSQL     string
-}
-
-type IndexInteriorCell struct {
-	//index interior page cell structure
-	// A 4-byte big-endian page number which is the left child pointer.
-	// A varint which is the total number of bytes of key payload, including any overflow
-	// The initial portion of the payload that does not spill to overflow pages.
-	// A 4-byte big-endian integer page number for the first page of the overflow page list - omitted if all payload fits on the b-tree page.
-	leftChildPointer uint32
-	payloadSize      uint32
-	payload          []byte
-	overflowPage     uint32
-	key              []byte
-}
-
-type TableInTeriorCell struct {
-	leftChildPointer uint32
-	rowId            int64
-}
-
-type IndexLeafCell struct {
-	payloadSize  uint32
-	payload      []byte
-	rowId        int64
-	overflowPage uint32
-	key          []byte
-}
-type pageHeaderStruct struct {
-	pageType         byte
-	firstFreeBlock   uint16
-	numberOfCells    uint16
-	startOfCellArea  uint16
-	numberOfFragment byte
-	rightPagePointer uint32
-}
-
 const TABLE_SQLITE_SCHEMA = "sqlite_schema"
 
 var SQLITE_MASTER_TABLE_OBJECT = objectMetadata{
@@ -108,25 +24,6 @@ var SQLITE_MASTER_TABLE_OBJECT = objectMetadata{
 	indexes:             []indexMetadata{},
 }
 
-// Table B-Tree Leaf Cell (header 0x0d):
-//
-// A varint which is the total number of bytes of payload, including any overflow
-// A varint which is the integer key, a.k.a. "rowid"
-// The initial portion of the payload that does not spill to overflow pages.
-// A 4-byte big-endian integer page number for the first page of the overflow page list - omitted if all payload fits on the b-tree page.
-//
-// Table B-Tree Interior Cell (header 0x05):
-//
-// A 4-byte big-endian page number which is the left child pointer.
-// A varint which is the integer key
-//
-// Index B-Tree Leaf Cell (header 0x0a):
-//
-// A varint which is the total number of bytes of key payload, including any overflow
-// The initial portion of the payload that does not spill to overflow pages.
-// A 4-byte big-endian integer page number for the first page of the overflow page list - omitted if all payload fits on the b-tree page.
-//
-// Index B-Tree Interior Cell (header 0x02):
 var B_TREE_PAGE_TYPES = struct {
 	INDEX_LEAF_PAGE     byte
 	INDEX_INTERIOR_PAGE byte
@@ -367,22 +264,6 @@ func getColumnValue(rowContent []byte, serialType uint64) (interface{}, uint64) 
 	return nil, 0
 }
 
-// for now we are considering that all roq data is contained in a single page
-
-// write your own parsing logic here
-//assumptions
-// the command is a always a select query
-// there can be single, multiple column names or count(*) in the select clause
-//only one where condition which is an equality condition // add support for other operators later
-// no joins
-// no nested queries
-// no aggergation functions except count(*)
-// no group by or order by clauses
-// no limit or offset clauses
-// the data is always contained in the single page
-//sample command : SELECT name, color FROM apples WHERE color = 'Yellow'
-
-// trim the command and split by spaces
 func parseQuery(sql string) queryToken {
 	//write a better parser later
 	sql = strings.TrimSpace(sql)
@@ -431,27 +312,6 @@ func parseQuery(sql string) queryToken {
 	return queryToken
 }
 
-// func getCellOffSetsFromPage(pageContent []byte) []cellOffSets {
-// 	if pageContent[0] != 0x0D {
-// 		log.Fatal("only leaf pages are supported currently")
-// 	}
-// 	pageHeader := pageContent[0:8]
-// 	numberOfCells := binary.BigEndian.Uint16(pageHeader[3:5])
-// 	cellOffSetsArray := pageContent[8 : 8+2*numberOfCells]
-// 	var cellOffSetsArrayParsed []cellOffSets
-// 	for i := 0; i < int(numberOfCells); i++ {
-// 		var cellOffset cellOffSets
-// 		cellOffset.cellStartOffSet = binary.BigEndian.Uint16(cellOffSetsArray[i*2 : (i*2)+2])
-// 		if i == 0 {
-// 			cellOffset.cellEndOffSet = DatabaseHeader.PageSize - uint16(DatabaseHeader.ReservedSpacePerPage)
-// 		} else {
-// 			cellOffset.cellEndOffSet = binary.BigEndian.Uint16(cellOffSetsArray[(i-1)*2 : ((i-1)*2)+2])
-// 		}
-// 		cellOffSetsArrayParsed = append(cellOffSetsArrayParsed, cellOffset)
-// 	}
-// 	return cellOffSetsArrayParsed
-// }
-
 func getCellOffSetsFromPage(pageContent []byte, pageHeader pageHeaderStruct) []uint16 {
 
 	pageType := pageHeader.pageType
@@ -471,25 +331,7 @@ func getCellOffSetsFromPage(pageContent []byte, pageHeader pageHeaderStruct) []u
 	}
 	return cellOffSets
 }
-func parseCellData(cellContent []byte, tableColumnArray []string, pageType byte, file *os.File, isIntegerPrimaryKey bool) map[string]interface{} {
-	switch pageType {
-	case B_TREE_PAGE_TYPES.Table_Leaf_Page:
-		parsedCell, _ := parseTableLeafCellPayload(cellContent, tableColumnArray, file, pageType, isIntegerPrimaryKey)
-		return parsedCell
-	case B_TREE_PAGE_TYPES.INDEX_LEAF_PAGE:
-		//parse index leaf cell payload
-		// return parseIndexLeafCellPayload(cellContent, tableColumnArray)
-	case B_TREE_PAGE_TYPES.Table_Interior_Page:
-		//parse table interior cell payload
-		// return parseTableInteriorCellPayload(cellContent, tableColumnArray)
-	case B_TREE_PAGE_TYPES.INDEX_INTERIOR_PAGE:
-		//parse index interior cell payload
-		// return parseIndexInteriorCellPayload(cellContent, tableColumnArray)
-	default:
-		log.Fatal("unsupported page type for parsing cell data")
-	}
-	return nil
-}
+
 func loadSQLiteSchema(file *os.File) []map[string]interface{} {
 	firstPageContent, err := getPageContent(1, file)
 	if err != nil {
@@ -500,8 +342,8 @@ func loadSQLiteSchema(file *os.File) []map[string]interface{} {
 	var resultedRowsArray []map[string]interface{}
 	for i := 0; i < len(cellOffSetsArray); i++ {
 		cellContent := firstPageContent[cellOffSetsArray[i]:]
-		rowDataMap := parseCellData(cellContent, SQLITE_MASTER_COLUMNS, pageHeader.pageType, file, SQLITE_MASTER_TABLE_OBJECT.isIntegerPrimaryKey)
-		resultedRowsArray = append(resultedRowsArray, rowDataMap)
+		parsedCell, _ := parseTableLeafCellPayload(cellContent, SQLITE_MASTER_TABLE_OBJECT.columns, file, pageHeader.pageType, SQLITE_MASTER_TABLE_OBJECT.isIntegerPrimaryKey)
+		resultedRowsArray = append(resultedRowsArray, parsedCell)
 	}
 	return resultedRowsArray
 }
@@ -527,26 +369,18 @@ func loadAllObjectMetadata(file *os.File) map[string]objectMetadata {
 }
 
 func parseIndexInteriorCellData(cellContent []byte, file *os.File) IndexInteriorCell {
-	// Index interior cell layout:
-	// 4-byte left child pointer
-	// varint payload size
-	// payload (record header + record body, possibly with overflow)
-	// A 4-byte big-endian integer page number for the first page of the overflow page list - omitted if all payload fits on the b-tree page.
 	var indexInteriorCell IndexInteriorCell
 	indexInteriorCell.leftChildPointer = binary.BigEndian.Uint32(cellContent[0:4])
 
 	payloadSize, n := decodeVarint(cellContent[4:])
 	indexInteriorCell.payloadSize = uint32(payloadSize)
 
-	// Start of payload is immediately after the payloadSize varint.
 	payload := getPayloadBytes(int64(payloadSize), cellContent[4+n:], file, B_TREE_PAGE_TYPES.INDEX_INTERIOR_PAGE)
 
-	// Payload is a SQLite record: [headerSize varint][header][body]
 	headerSize, headerVarintLen := decodeVarint(payload)
 	header := payload[headerVarintLen:headerSize]
 	body := payload[headerSize:]
 
-	// We only care about the first column (the index key).
 	cellKeySerialType, _ := decodeVarint(header)
 
 	keyBytes, _ := getColumnValue(body, uint64(cellKeySerialType))
@@ -614,9 +448,6 @@ func getIndexLeafPageId(queryToken queryToken, pageId uint32, file *os.File) (ui
 			cellContent := indexPageContent[cellOffSetsArray[i]:]
 			indexInteriorCell := parseIndexInteriorCellData(cellContent, file)
 			key := string(indexInteriorCell.key)
-			// for _, b := range key {
-			// 	fmt.Printf("%08b ", b)
-			// }
 			if strings.Compare(queryToken.filterValue, key) <= 0 {
 				keyFound = true
 				leftPagePointer = indexInteriorCell.leftChildPointer
@@ -632,9 +463,6 @@ func getIndexLeafPageId(queryToken queryToken, pageId uint32, file *os.File) (ui
 	return getIndexLeafPageId(queryToken, leftPagePointer, file)
 }
 
-// A varint which is the total number of bytes of key payload, including any overflow
-// The initial portion of the payload that does not spill to overflow pages.
-// A 4-byte big-endian integer page number for the first page of the overflow page list - omitted if all payload fits on the b-tree page.
 func parseIndexLeafCellData(cellContent []byte, indexColumns []string, file *os.File, pageType byte) IndexLeafCell {
 	var indexLeafCell IndexLeafCell
 	payloadSize, n := decodeVarint(cellContent)
@@ -654,9 +482,10 @@ func parseIndexLeafCellData(cellContent []byte, indexColumns []string, file *os.
 		unparsedBytes := payloadBody[payloadIndex:]
 		val, m := getColumnValue(unparsedBytes, serialType)
 		payloadIndex += int(m)
-		if i == 0 {
+		switch i {
+		case 0:
 			indexLeafCell.key = val.([]byte)
-		} else if i == 1 {
+		case 1:
 			indexLeafCell.rowId = int64(binary.BigEndian.Uint64(padBytes(val.([]byte), 8)))
 		}
 	}
@@ -697,9 +526,10 @@ func getLeafPageOfTableIndex(rowId int64, pageId uint32, file *os.File, pagesInM
 		}
 	}
 	pageHeader := getPageHeader(pageContent)
-	if pageHeader.pageType == B_TREE_PAGE_TYPES.Table_Leaf_Page {
+	switch pageHeader.pageType {
+	case B_TREE_PAGE_TYPES.Table_Leaf_Page:
 		return pageId, nil
-	} else if pageHeader.pageType == B_TREE_PAGE_TYPES.Table_Interior_Page {
+	case B_TREE_PAGE_TYPES.Table_Interior_Page:
 		cellOffSetsArray := getCellOffSetsFromPage(pageContent, pageHeader)
 		parsedCells := make([]TableInTeriorCell, 0)
 		for i := 0; i < len(cellOffSetsArray); i++ {
@@ -724,26 +554,17 @@ func getLeafPageOfTableIndex(rowId int64, pageId uint32, file *os.File, pagesInM
 	return 0, fmt.Errorf("invalid table page type")
 }
 
-// overflow calculation
-// U : page size - reserved bytes per page
-// X = maximum payload size that can fit in U (U-35 for table b-tree leaf page and  ((U-12)*64/255)-23 for index b-tree leaf page)
-// P : payload size
-// M is always ((U-12)*32/255)-23. (minimum payload size that should be stored in b-tree leaf page)
-// K : amount of payload stored in b-tree leaf page M+((P-M)%(U-4)).
-// If P<=X then all P bytes of payload are stored directly on the btree page without overflow.
-// If P>X and K<=X then the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
-// If P>X and K>X then the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
-
 func getPayloadBytes(payloadSize int64, cellContent []byte, file *os.File, pageType byte) []byte {
 	//calculate the payload that stored in this page based on the usable page size
 	var fullPayloadData []byte
 	U := int64(DatabaseHeader.PageSize) - int64(DatabaseHeader.ReservedSpacePerPage)
 	var X int64
-	if pageType == B_TREE_PAGE_TYPES.Table_Leaf_Page {
+	switch pageType {
+	case B_TREE_PAGE_TYPES.Table_Leaf_Page:
 		X = U - 35
-	} else if pageType == B_TREE_PAGE_TYPES.INDEX_LEAF_PAGE || pageType == B_TREE_PAGE_TYPES.INDEX_INTERIOR_PAGE {
+	case B_TREE_PAGE_TYPES.INDEX_LEAF_PAGE, B_TREE_PAGE_TYPES.INDEX_INTERIOR_PAGE:
 		X = ((U - 12) * 64 / 255) - 23
-	} else {
+	default:
 		// For table interior pages, treat similarly to leaf pages
 		X = U - 35
 	}
@@ -775,7 +596,6 @@ func getPayloadBytes(payloadSize int64, cellContent []byte, file *os.File, pageT
 		}
 		fullPayloadData = append(fullPayloadData, remainingPayload...)
 	}
-	// fmt.Println("U ", U, " X", X, " P", P, " K", K, " M", M)
 	return fullPayloadData
 }
 
@@ -809,27 +629,6 @@ func parseTableLeafCellPayload(cellContent []byte, tableColumnArray []string, fi
 	return rowData, uint64(rowId)
 }
 
-//	func parseTableLeafCellPayload(payload []byte, columns []string) map[string]interface{} {
-//		headerSize, k := decodeVarint(payload)
-//		header := payload[k:headerSize]
-//		var serialTypes []uint64
-//		for j := 0; j < int(headerSize); {
-//			serialType, l := decodeVarint(header[j:])
-//			serialTypes = append(serialTypes, uint64(serialType))
-//			j = j + l
-//		}
-//		payloadBody := payload[headerSize:]
-//		payloadIndex := 0
-//		rowData := make(map[string]interface{})
-//		fmt.Println("serialTypes", serialTypes, "columns", columns)
-//		for i, serialType := range serialTypes {
-//			unparsedBytes := payloadBody[payloadIndex:]
-//			val, k := getColumnValue(unparsedBytes, serialType)
-//			payloadIndex += int(k)
-//			rowData[columns[i]] = val
-//		}
-//		return rowData
-//	}
 func getTableDataFromTableIndex(rowIds []int64, tableMetadata objectMetadata, file *os.File, pagesInMemory map[uint32][]byte) ([]map[string]interface{}, error) {
 	parsedTableData := make([]map[string]interface{}, 0)
 	for _, rowId := range rowIds {
@@ -865,7 +664,8 @@ func getFullTableData(rootPage uint32, columns []string, file *os.File, pagesInM
 		pagesInMemory[rootPage] = pageContent
 	}
 	pageHeader := getPageHeader(pageContent)
-	if pageHeader.pageType == B_TREE_PAGE_TYPES.Table_Leaf_Page {
+	switch pageHeader.pageType {
+	case B_TREE_PAGE_TYPES.Table_Leaf_Page:
 		// fmt.Println(100)
 		cellOffSetsArray := getCellOffSetsFromPage(pageContent, pageHeader)
 		for i := 0; i < len(cellOffSetsArray); i++ {
@@ -873,7 +673,7 @@ func getFullTableData(rootPage uint32, columns []string, file *os.File, pagesInM
 			parsedCellContent, _ := parseTableLeafCellPayload(cellContent, columns, file, pageHeader.pageType, isIntegerPrimaryKey)
 			*parsedTableData = append(*parsedTableData, parsedCellContent)
 		}
-	} else if pageHeader.pageType == B_TREE_PAGE_TYPES.Table_Interior_Page {
+	case B_TREE_PAGE_TYPES.Table_Interior_Page:
 		cellOffSetsArray := getCellOffSetsFromPage(pageContent, pageHeader)
 		for i := 0; i < len(cellOffSetsArray); i++ {
 			cellContent := pageContent[cellOffSetsArray[i]:]
@@ -889,6 +689,124 @@ func getFullTableData(rootPage uint32, columns []string, file *os.File, pagesInM
 		}
 	}
 	return nil
+}
+
+func handleSelectCommand(command string, file *os.File) {
+	if !strings.HasPrefix(strings.ToUpper(command), "SELECT") {
+		fmt.Println("Only SELECT queries are supported currently")
+		os.Exit(1)
+	}
+	queryToken := parseQuery(command)
+	parsedObjectsMetadataMap = loadAllObjectMetadata(file)
+	tableMetadata, exist := parsedObjectsMetadataMap[queryToken.tableName]
+	if !exist {
+		fmt.Println("Table not found:", queryToken.tableName)
+		os.Exit(1)
+	}
+
+	if len(tableMetadata.indexes) > 0 && queryToken.filterColumnName != "" {
+		var indexToSearch indexMetadata
+		for _, index := range tableMetadata.indexes {
+			if len(index.columns) > 0 && strings.TrimSpace(index.columns[0]) == queryToken.filterColumnName {
+				indexToSearch = index
+				break
+			}
+		}
+		if indexToSearch.indexName != "" {
+			indexMetaData := parsedObjectsMetadataMap[indexToSearch.indexName]
+			leafPageId, _, err := getIndexLeafPageId(queryToken, indexMetaData.coreObject.rootPage, file)
+			if err != nil {
+				log.Fatal(err)
+			}
+			tableIndexRowIds, err := getRowIdsFromIndexLeafPage(queryToken, indexToSearch.columns, leafPageId, file)
+			if err != nil {
+				log.Fatal(err)
+			}
+			var pagesInMemory = make(map[uint32][]byte)
+			parsedTableData, err := getTableDataFromTableIndex(tableIndexRowIds, tableMetadata, file, pagesInMemory)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if len(queryToken.selectClauseParts) == 1 && strings.ToUpper(queryToken.selectClauseParts[0]) == "COUNT(*)" {
+				return
+			} else {
+				var resultRows []string
+				for _, row := range parsedTableData {
+					var selectedValues []string
+					for _, colPart := range queryToken.selectClauseParts {
+						colPart = strings.TrimSpace(colPart)
+						if val, exist := row[colPart]; exist {
+							strVal, ok := val.([]byte)
+							if ok {
+								selectedValues = append(selectedValues, string(strVal))
+							} else {
+								selectedValues = append(selectedValues, fmt.Sprintf("%v", val))
+							}
+						} else {
+							selectedValues = append(selectedValues, "NULL")
+						}
+					}
+					resultRows = append(resultRows, strings.Join(selectedValues, "|"))
+				}
+				for _, resultRow := range resultRows {
+					fmt.Println(resultRow)
+				}
+				return
+			}
+		}
+	}
+
+	// load data from all table pages
+	var pagesInMemory = make(map[uint32][]byte)
+	var parsedTableData []map[string]interface{}
+	err := getFullTableData(tableMetadata.coreObject.rootPage, tableMetadata.columns, file, pagesInMemory, &parsedTableData, tableMetadata.isIntegerPrimaryKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var filteredData []map[string]interface{}
+	if queryToken.filterColumnName != "" {
+		for _, row := range parsedTableData {
+			if val, exist := row[queryToken.filterColumnName]; exist {
+				strVal, ok := val.([]byte)
+				if ok && string(strVal) == queryToken.filterValue {
+					filteredData = append(filteredData, row)
+				}
+			}
+		}
+	} else {
+		filteredData = parsedTableData
+	}
+
+	//prepare the result based on select clause parts
+	if len(queryToken.selectClauseParts) == 1 && strings.ToUpper(queryToken.selectClauseParts[0]) == "COUNT(*)" {
+		fmt.Println(len(filteredData))
+		return
+	} else {
+		var resultRows []string
+		for _, row := range filteredData {
+			var selectedValues []string
+			for _, colPart := range queryToken.selectClauseParts {
+				colPart = strings.TrimSpace(colPart)
+				if val, exist := row[colPart]; exist {
+					strVal, ok := val.([]byte)
+					if ok {
+						selectedValues = append(selectedValues, string(strVal))
+					} else {
+						selectedValues = append(selectedValues, fmt.Sprintf("%v", val))
+					}
+				} else {
+					selectedValues = append(selectedValues, "NULL")
+				}
+			}
+			resultRows = append(resultRows, strings.Join(selectedValues, "|"))
+		}
+		for _, resultRow := range resultRows {
+			fmt.Println(resultRow)
+		}
+		return
+	}
+
 }
 func main() {
 	databaseFilePath = os.Args[1]
@@ -933,123 +851,11 @@ func main() {
 		sort.Strings(tableNames)
 		fmt.Print(strings.Join(tableNames, " "))
 	default:
-		queryToken := parseQuery(command)
-		parsedObjectsMetadataMap = loadAllObjectMetadata(file)
-		tableMetadata, exist := parsedObjectsMetadataMap[queryToken.tableName]
-		if !exist {
-			fmt.Println("Table not found:", queryToken.tableName)
+
+		if !strings.HasPrefix(strings.ToUpper(command), "SELECT") {
+			fmt.Println("Only SELECT queries are supported currently")
 			os.Exit(1)
 		}
-
-		if len(tableMetadata.indexes) > 0 && queryToken.filterColumnName != "" {
-			var indexToSearch indexMetadata
-			for _, index := range tableMetadata.indexes {
-				if len(index.columns) > 0 && strings.TrimSpace(index.columns[0]) == queryToken.filterColumnName {
-					indexToSearch = index
-					break
-				}
-			}
-			if indexToSearch.indexName != "" {
-				indexMetaData := parsedObjectsMetadataMap[indexToSearch.indexName]
-				leafPageId, _, err := getIndexLeafPageId(queryToken, indexMetaData.coreObject.rootPage, file)
-				if err != nil {
-					log.Fatal(err)
-				}
-				tableIndexRowIds, err := getRowIdsFromIndexLeafPage(queryToken, indexToSearch.columns, leafPageId, file)
-				// fmt.Println("row ids from index", tableIndexRowIds)
-				if err != nil {
-					log.Fatal(err)
-				}
-				var pagesInMemory = make(map[uint32][]byte)
-				parsedTableData, err := getTableDataFromTableIndex(tableIndexRowIds, tableMetadata, file, pagesInMemory)
-				if err != nil {
-					log.Fatal(err)
-				}
-				//as this data is already filtered based on where condition, we can directly prepare the result
-				if len(queryToken.selectClauseParts) == 1 && strings.ToUpper(queryToken.selectClauseParts[0]) == "COUNT(*)" {
-					// fmt.Println(len(parsedTableData))
-					return
-				} else {
-					var resultRows []string
-					for _, row := range parsedTableData {
-						var selectedValues []string
-						for _, colPart := range queryToken.selectClauseParts {
-							colPart = strings.TrimSpace(colPart)
-							if val, exist := row[colPart]; exist {
-								strVal, ok := val.([]byte)
-								if ok {
-									selectedValues = append(selectedValues, string(strVal))
-								} else {
-									selectedValues = append(selectedValues, fmt.Sprintf("%v", val))
-								}
-							} else {
-								selectedValues = append(selectedValues, "NULL")
-							}
-						}
-						resultRows = append(resultRows, strings.Join(selectedValues, "|"))
-					}
-					for _, resultRow := range resultRows {
-						fmt.Println(resultRow)
-					}
-					return
-				}
-			}
-		}
-		// load data from all table pages
-		var pagesInMemory = make(map[uint32][]byte)
-		var parsedTableData []map[string]interface{}
-		//get raw data from the root page of the table
-		//traverse through all the pages of the table to get complete data
-		//first get data from root page
-		//perform a DFS based traversal to get data from all pages
-		//if a leaf page is encountered, parse the data and store it
-		err := getFullTableData(tableMetadata.coreObject.rootPage, tableMetadata.columns, file, pagesInMemory, &parsedTableData, tableMetadata.isIntegerPrimaryKey)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		//filter the data based on where condition if present
-		var filteredData []map[string]interface{}
-		if queryToken.filterColumnName != "" {
-			for _, row := range parsedTableData {
-				if val, exist := row[queryToken.filterColumnName]; exist {
-					strVal, ok := val.([]byte)
-					if ok && string(strVal) == queryToken.filterValue {
-						filteredData = append(filteredData, row)
-					}
-				}
-			}
-		} else {
-			filteredData = parsedTableData
-		}
-
-		//prepare the result based on select clause parts
-		if len(queryToken.selectClauseParts) == 1 && strings.ToUpper(queryToken.selectClauseParts[0]) == "COUNT(*)" {
-			fmt.Println(len(filteredData))
-			return
-		} else {
-			var resultRows []string
-			for _, row := range filteredData {
-				var selectedValues []string
-				for _, colPart := range queryToken.selectClauseParts {
-					colPart = strings.TrimSpace(colPart)
-					if val, exist := row[colPart]; exist {
-						strVal, ok := val.([]byte)
-						if ok {
-							selectedValues = append(selectedValues, string(strVal))
-						} else {
-							selectedValues = append(selectedValues, fmt.Sprintf("%v", val))
-						}
-					} else {
-						selectedValues = append(selectedValues, "NULL")
-					}
-				}
-				resultRows = append(resultRows, strings.Join(selectedValues, "|"))
-			}
-			for _, resultRow := range resultRows {
-				fmt.Println(resultRow)
-			}
-			return
-		}
+		handleSelectCommand(command, file)
 	}
 }
